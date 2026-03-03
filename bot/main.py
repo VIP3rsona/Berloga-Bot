@@ -40,8 +40,8 @@ MIN_MSG_LEN = 8   # короткие сообщения не считаем
 # VOICE XP (очень мало + анти-фарм)
 VOICE_XP_MIN = 2
 VOICE_XP_MAX = 4
-VOICE_TICK_SEC = 30        # 3 минуты
-VOICE_MIN_MEMBERS = 1       # минимум людей в войсе
+VOICE_TICK_SEC = 180        # 3 минуты
+VOICE_MIN_MEMBERS = 2       # минимум людей в войсе
 VOICE_IGNORE_DEAFENED = True
 
 # =========================
