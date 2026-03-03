@@ -2,7 +2,7 @@ import os
 import random
 import time
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 # =========================
@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 # Сообщение, на которое ставят реакции (можно не заполнять руками, см. команду !setrolemsg)
 ROLE_MESSAGE_ID = int(os.getenv("ROLE_MESSAGE_ID", "0"))
 
-# emoji -> role_id (ЗАМЕНИ role_id на реальные)
+# emoji -> role_id
 REACTION_ROLE_MAP = {
     "🎯": 1477939798600712222,  # Спиннинг
     "🐟": 1477940426085367808,  # Донка
@@ -23,7 +23,6 @@ REACTION_ROLE_MAP = {
 }
 
 # Уровни/роли (выдаём ТОЛЬКО самую высокую подходящую роль)
-# level_required -> role_id (ЗАМЕНИ role_id на реальные)
 LEVEL_ROLE_LADDER = {
     1: 1477952593618534400,    # 🐣 Новичок
     5: 1477952664900997191,    # 🐟 Рыбак
@@ -37,6 +36,13 @@ XP_MIN = 8
 XP_MAX = 15
 XP_COOLDOWN = 90  # секунд между начислениями XP одному юзеру
 MIN_MSG_LEN = 8   # короткие сообщения не считаем
+
+# VOICE XP (очень мало + анти-фарм)
+VOICE_XP_MIN = 2
+VOICE_XP_MAX = 4
+VOICE_TICK_SEC = 30        # 3 минуты
+VOICE_MIN_MEMBERS = 1       # минимум людей в войсе
+VOICE_IGNORE_DEAFENED = True
 
 # =========================
 # INIT
@@ -56,6 +62,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # XP хранилище (в памяти)
 USER_XP: dict[tuple[int, int], int] = {}       # (guild_id, user_id) -> xp
 LAST_XP_TS: dict[tuple[int, int], float] = {}  # (guild_id, user_id) -> timestamp
+
+# Кто сейчас "учитывается" в войсе (помогает фильтровать deaf/выходы)
+IN_VOICE: dict[tuple[int, int], bool] = {}     # (guild_id, user_id) -> True
 
 
 # =========================
@@ -93,11 +102,9 @@ async def apply_level_role(member: discord.Member, level: int):
     if not target_role:
         return
 
-    # все роли "рангов" (которые мы управляем)
     ladder_role_ids = set(LEVEL_ROLE_LADDER.values())
     member_role_ids = {r.id for r in member.roles}
 
-    # если уже есть целевая роль и нет других ранговых — всё ок
     if target_role_id in member_role_ids and len(member_role_ids.intersection(ladder_role_ids)) == 1:
         return
 
@@ -123,8 +130,11 @@ async def add_reaction_role(guild_id: int, user_id: int, emoji: str):
         return
 
     member = guild.get_member(user_id)
-    if not member:
-        return
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except Exception:
+            return
 
     role = guild.get_role(role_id)
     if not role:
@@ -149,8 +159,11 @@ async def remove_reaction_role(guild_id: int, user_id: int, emoji: str):
         return
 
     member = guild.get_member(user_id)
-    if not member:
-        return
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except Exception:
+            return
 
     role = guild.get_role(role_id)
     if not role:
@@ -165,6 +178,55 @@ async def remove_reaction_role(guild_id: int, user_id: int, emoji: str):
         print("Ошибка снятия reaction роли:", e)
 
 
+def member_voice_eligible(member: discord.Member) -> bool:
+    vs = member.voice
+    if not vs or not vs.channel:
+        return False
+    if VOICE_IGNORE_DEAFENED and (vs.self_deaf or vs.deaf):
+        return False
+    return True
+
+
+def eligible_members_in_channel(channel: discord.VoiceChannel | discord.StageChannel) -> list[discord.Member]:
+    members: list[discord.Member] = []
+    for m in channel.members:
+        if isinstance(m, discord.Member) and (not m.bot) and member_voice_eligible(m):
+            members.append(m)
+    return members
+
+
+# =========================
+# VOICE XP LOOP
+# =========================
+
+@tasks.loop(seconds=VOICE_TICK_SEC)
+async def voice_xp_tick():
+    for guild in bot.guilds:
+        for channel in guild.voice_channels:
+            eligible = eligible_members_in_channel(channel)
+
+            # анти-фарм: минимум людей
+            if len(eligible) < VOICE_MIN_MEMBERS:
+                continue
+
+            for member in eligible:
+                key = (guild.id, member.id)
+                if not IN_VOICE.get(key):
+                    continue
+
+                gained = random.randint(VOICE_XP_MIN, VOICE_XP_MAX)
+
+                old_xp = USER_XP.get(key, 0)
+                new_xp = old_xp + gained
+                USER_XP[key] = new_xp
+
+                old_lvl = level_from_xp(old_xp)
+                new_lvl = level_from_xp(new_xp)
+
+                if new_lvl > old_lvl:
+                    await apply_level_role(member, new_lvl)
+
+
 # =========================
 # EVENTS
 # =========================
@@ -172,8 +234,8 @@ async def remove_reaction_role(guild_id: int, user_id: int, emoji: str):
 @bot.event
 async def on_ready():
     print(f"🐻 Berloga Bot запущен как {bot.user}")
-    # Можно попытаться "досинхронизировать" реакции (если бот перезапускался)
-    # но без message fetch это не критично.
+    if not voice_xp_tick.is_running():
+        voice_xp_tick.start()
 
 
 @bot.command()
@@ -192,8 +254,26 @@ async def on_member_join(member: discord.Member):
             "Удачного клёва!"
         )
     except Exception:
-        # у человека могут быть закрыты личные сообщения
         print("Не удалось отправить ЛС пользователю")
+
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if not member.guild:
+        return
+
+    key = (member.guild.id, member.id)
+
+    if after.channel is None:
+        IN_VOICE.pop(key, None)
+        return
+
+    # в войсе, но если deaf — не учитываем
+    if VOICE_IGNORE_DEAFENED and (after.self_deaf or after.deaf):
+        IN_VOICE.pop(key, None)
+        return
+
+    IN_VOICE[key] = True
 
 
 @bot.event
@@ -231,10 +311,8 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    # сначала команды
     await bot.process_commands(message)
 
-    # XP начисляем только в гильдии
     key = (message.guild.id, message.author.id)
     now = time.time()
 
@@ -256,7 +334,6 @@ async def on_message(message: discord.Message):
     new_lvl = level_from_xp(new_xp)
 
     if new_lvl > old_lvl:
-        # выдаём/обновляем ранговую роль
         try:
             await apply_level_role(message.author, new_lvl)
         except Exception as e:
@@ -273,23 +350,20 @@ def is_admin(member: discord.Member) -> bool:
 
 @bot.command()
 async def setrolemsg(ctx, message_id: int):
-    """Задаёт ID сообщения для reaction-ролей."""
     if not is_admin(ctx.author):
         return await ctx.reply("⛔ Только админ может это делать.")
 
     global ROLE_MESSAGE_ID
     ROLE_MESSAGE_ID = int(message_id)
 
-    await ctx.reply(f"✅ ROLE_MESSAGE_ID установлен: `{ROLE_MESSAGE_ID}`\n"
-                    f"Теперь реакции на это сообщение будут выдавать роли.")
+    await ctx.reply(
+        f"✅ ROLE_MESSAGE_ID установлен: `{ROLE_MESSAGE_ID}`\n"
+        f"Теперь реакции на это сообщение будут выдавать роли."
+    )
 
 
 @bot.command()
 async def syncroles(ctx):
-    """
-    Добавляет на сообщение все нужные реакции (удобно для панели ролей).
-    Использование: !syncroles (в канале, где сообщение)
-    """
     if not is_admin(ctx.author):
         return await ctx.reply("⛔ Только админ может это делать.")
     if not ROLE_MESSAGE_ID:
@@ -298,8 +372,10 @@ async def syncroles(ctx):
     try:
         msg = await ctx.channel.fetch_message(ROLE_MESSAGE_ID)
     except Exception:
-        return await ctx.reply("❌ Не смог найти сообщение по ROLE_MESSAGE_ID в этом канале. "
-                               "Убедись, что ты запускаешь команду в том же канале.")
+        return await ctx.reply(
+            "❌ Не смог найти сообщение по ROLE_MESSAGE_ID в этом канале. "
+            "Убедись, что ты запускаешь команду в том же канале."
+        )
 
     for emoji in REACTION_ROLE_MAP.keys():
         try:
@@ -312,7 +388,6 @@ async def syncroles(ctx):
 
 @bot.command()
 async def xp(ctx, member: discord.Member | None = None):
-    """Показывает XP."""
     member = member or ctx.author
     key = (ctx.guild.id, member.id)
     xp_val = USER_XP.get(key, 0)
@@ -322,7 +397,6 @@ async def xp(ctx, member: discord.Member | None = None):
 
 @bot.command()
 async def rank(ctx, member: discord.Member | None = None):
-    """Показывает текущий ранговый уровень/роль."""
     member = member or ctx.author
     key = (ctx.guild.id, member.id)
     xp_val = USER_XP.get(key, 0)
