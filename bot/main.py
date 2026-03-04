@@ -4,7 +4,7 @@ import time
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-
+import asyncpg
 # =========================
 # CONFIG (настрой здесь)
 # =========================
@@ -50,6 +50,9 @@ VOICE_IGNORE_DEAFENED = True
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+db = None
 
 intents = discord.Intents.default()
 intents.members = True
@@ -233,7 +236,43 @@ async def voice_xp_tick():
 
 @bot.event
 async def on_ready():
+    global db
+
     print(f"🐻 Berloga Bot запущен как {bot.user}")
+
+    if DATABASE_URL and db is None:
+        db = await asyncpg.connect(DATABASE_URL)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS user_stats (
+            guild_id BIGINT,
+            user_id BIGINT,
+            xp INT DEFAULT 0,
+            voice_seconds INT DEFAULT 0,
+            message_count INT DEFAULT 0,
+            PRIMARY KEY (guild_id, user_id)
+        );
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS reaction_roles (
+            guild_id BIGINT,
+            message_id BIGINT,
+            emoji TEXT,
+            role_id BIGINT
+        );
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS moderation_settings (
+            guild_id BIGINT PRIMARY KEY,
+            block_everyone BOOLEAN DEFAULT true,
+            timeout_minutes INT DEFAULT 60
+        );
+        """)
+
+        print("✅ Database connected")
+
     if not voice_xp_tick.is_running():
         voice_xp_tick.start()
 
