@@ -219,9 +219,28 @@ async def voice_xp_tick():
 
                 gained = random.randint(VOICE_XP_MIN, VOICE_XP_MAX)
 
-                old_xp = USER_XP.get(key, 0)
-                new_xp = old_xp + gained
-                USER_XP[key] = new_xp
+                row = await db.fetchrow(
+    "SELECT xp FROM user_stats WHERE guild_id=$1 AND user_id=$2",
+    message.guild.id,
+    message.author.id
+)
+
+old_xp = row["xp"] if row else 0
+new_xp = old_xp + gained
+
+await db.execute("""
+INSERT INTO user_stats (guild_id, user_id, xp, message_count)
+VALUES ($1,$2,$3,1)
+ON CONFLICT (guild_id,user_id)
+DO UPDATE SET
+xp = user_stats.xp + $4,
+message_count = user_stats.message_count + 1
+""",
+message.guild.id,
+message.author.id,
+gained,
+gained
+)
 
                 old_lvl = level_from_xp(old_xp)
                 new_lvl = level_from_xp(new_xp)
