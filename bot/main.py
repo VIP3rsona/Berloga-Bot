@@ -503,6 +503,31 @@ async def rank(ctx, member: Optional[discord.Member] = None):
     role = ctx.guild.get_role(role_id) if role_id else None
     await ctx.reply(f"🏅 {member.mention}: уровень **{lvl}** | роль: **{role.name if role else 'нет'}**")
 
+@bot.command()
+@commands.is_owner()
+async def recalcall(ctx):
+    await ctx.send("🔄 Пересчитываю роли всем участникам...")
+
+    count = 0
+
+    for member in ctx.guild.members:
+        if member.bot:
+            continue
+
+        try:
+            xp_val, _, _ = await get_user_row(ctx.guild.id, member.id)
+            lvl = level_from_xp(xp_val)
+
+            await apply_level_role(member, lvl)
+
+            count += 1
+            await asyncio.sleep(0.3)
+
+        except Exception as e:
+            print("recalcall error:", e)
+
+    await ctx.send(f"✅ Готово. Пересчитано ролей: **{count}**")
+
 # =========================
 # COMMANDS (owner/admin)
 # =========================
