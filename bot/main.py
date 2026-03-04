@@ -350,26 +350,26 @@ async def auto_voice_cleanup_loop():
 async def voice_xp_tick():
     if not db:
         return
-   for guild in bot.guilds:
-    for vc in guild.voice_channels:
 
-        members = [m for m in vc.members if not m.bot]
+    for guild in bot.guilds:
+        for vc in guild.voice_channels:
+            members = [m for m in vc.members if not m.bot]
 
-        # минимум 2 человека в войсе для фарма XP
-        if len(members) < 2:
-            continue
+            # минимум 2 человека в войсе для фарма XP
+            if len(members) < 2:
+                continue
 
-        for m in members:
-            try:
-                old_xp, _, _ = await get_user_row(guild.id, m.id)
-                await add_voice_and_xp(guild.id, m.id, VOICE_TICK_SECONDS, VOICE_XP_PER_TICK)
-                new_xp, _, _ = await get_user_row(guild.id, m.id)
+            for m in members:
+                try:
+                    old_xp, _, _ = await get_user_row(guild.id, m.id)
+                    await add_voice_and_xp(guild.id, m.id, VOICE_TICK_SECONDS, VOICE_XP_PER_TICK)
+                    new_xp, _, _ = await get_user_row(guild.id, m.id)
 
-                if level_from_xp(new_xp) > level_from_xp(old_xp):
-                    await apply_level_role(m, level_from_xp(new_xp))
+                    if level_from_xp(new_xp) > level_from_xp(old_xp):
+                        await apply_level_role(m, level_from_xp(new_xp))
 
-            except Exception as e:
-                print("voice_xp_tick error:", e)
+                except Exception as e:
+                    print("voice_xp_tick error:", e)
 
 # =========================
 # EVENTS
