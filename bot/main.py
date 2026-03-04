@@ -1,15 +1,41 @@
 import os
-import random
 import time
+import random
+import asyncio
+from typing import Optional
+
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import asyncpg
+
+# =========================
+# ENV + INIT
+# =========================
+
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")  # в Railway: DATABASE_URL = ${{ Postgres.DATABASE_URL }}
+
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN не задан. Добавь переменную окружения DISCORD_TOKEN в Railway.")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL не задан. В Railway добавь DATABASE_URL = ${{ Postgres.DATABASE_URL }}")
+
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+intents.voice_states = True
+intents.reactions = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+db: Optional[asyncpg.Connection] = None
+
 # =========================
 # CONFIG (настрой здесь)
 # =========================
 
-# Сообщение, на которое ставят реакции (можно не заполнять руками, см. команду !setrolemsg)
+# Сообщение для реакций (можно не заполнять руками — команда !setrolemsg)
 ROLE_MESSAGE_ID = int(os.getenv("ROLE_MESSAGE_ID", "0"))
 
 # emoji -> role_id
@@ -22,7 +48,7 @@ REACTION_ROLE_MAP = {
     "🐠": 1477940771918315701,  # Универсал
 }
 
-# Уровни/роли (выдаём ТОЛЬКО самую высокую подходящую роль)
+# Ранги: выдаём ТОЛЬКО самый высокий подходящий
 LEVEL_ROLE_LADDER = {
     1: 1477952593618534400,    # 🐣 Новичок
     5: 1477952664900997191,    # 🐟 Рыбак
@@ -31,61 +57,67 @@ LEVEL_ROLE_LADDER = {
     30: 1477952930932985997,   # 👑 Легенда
 }
 
-# XP настройки (сложная прокачка)
-XP_MIN = 8
-XP_MAX = 15
-XP_COOLDOWN = 90  # секунд между начислениями XP одному юзеру
-MIN_MSG_LEN = 8   # короткие сообщения не считаем
+# XP за сообщения
+MSG_XP_MIN = 8
+MSG_XP_MAX = 15
+MSG_XP_COOLDOWN = 90  # сек между начислениями XP одному юзеру
+MIN_MSG_LEN = 8       # короткие сообщения не считаем
 
-# VOICE XP (очень мало + анти-фарм)
-VOICE_XP_MIN = 2
-VOICE_XP_MAX = 4
-VOICE_TICK_SEC = 180        # 3 минуты
-VOICE_MIN_MEMBERS = 2       # минимум людей в войсе
-VOICE_IGNORE_DEAFENED = True
+# XP за войс (оч мало, как ты хотел)
+VOICE_TICK_SECONDS = 60     # раз в 60 секунд проверяем войс
+VOICE_XP_PER_TICK = 1       # +1 XP за тик
+VOICE_MIN_MEMBERS = 1       # учитывать одиночку? да (для теста). Потом поставишь 2.
 
-# =========================
-# INIT
-# =========================
-
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-db = None
-
-intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
-intents.voice_states = True
-intents.reactions = True
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# XP хранилище (в памяти)
-USER_XP: dict[tuple[int, int], int] = {}       # (guild_id, user_id) -> xp
-LAST_XP_TS: dict[tuple[int, int], float] = {}  # (guild_id, user_id) -> timestamp
-
-# Кто сейчас "учитывается" в войсе (помогает фильтровать deaf/выходы)
-IN_VOICE: dict[tuple[int, int], bool] = {}     # (guild_id, user_id) -> True
-
+# Автовойс: канал-вход (установишь командой !setautovoice)
+AUTO_VOICE_HUB_ID = int(os.getenv("AUTO_VOICE_HUB_ID", "0"))
 
 # =========================
-# HELPERS
+# DB HELPERS
+# =========================
+
+async def db_exec(query: str, *args):
+    global db
+    if db is None:
+        return
+    try:
+        return await db.execute(query, *args)
+    except Exception as e:
+        print("DB execute error:", e)
+
+async def db_fetch(query: str, *args):
+    global db
+    if db is None:
+        return None
+    try:
+        return await db.fetch(query, *args)
+    except Exception as e:
+        print("DB fetch error:", e)
+        return None
+
+async def db_fetchrow(query: str, *args):
+    global db
+    if db is None:
+        return None
+    try:
+        return await db.fetchrow(query, *args)
+    except Exception as e:
+        print("DB fetchrow error:", e)
+        return None
+
+# =========================
+# XP / LEVEL HELPERS
 # =========================
 
 def level_from_xp(xp: int) -> int:
     """
-    Сложная прокачка: уровень растёт медленно.
-    Формула примерно: lvl = floor(sqrt(xp/600)) + 1
+    Сложная прокачка: медленно.
+    lvl = floor(sqrt(xp/600)) + 1
     """
     if xp <= 0:
         return 1
     return max(1, int((xp / 600) ** 0.5) + 1)
 
-
-def best_level_role_id(level: int) -> int | None:
-    """Возвращает role_id самой высокой роли, подходящей по уровню."""
+def best_level_role_id(level: int) -> Optional[int]:
     best = None
     for lvl_req, role_id in LEVEL_ROLE_LADDER.items():
         if level >= lvl_req:
@@ -93,9 +125,7 @@ def best_level_role_id(level: int) -> int | None:
                 best = (lvl_req, role_id)
     return best[1] if best else None
 
-
 async def apply_level_role(member: discord.Member, level: int):
-    """Оставляем у пользователя только 1 ранговую роль (самую высокую)."""
     target_role_id = best_level_role_id(level)
     if not target_role_id:
         return
@@ -118,10 +148,13 @@ async def apply_level_role(member: discord.Member, level: int):
         if target_role not in member.roles:
             await member.add_roles(target_role, reason="Level reward")
     except discord.Forbidden:
-        print("Нет прав управлять ролями (Forbidden). Проверь роль бота и её позицию.")
+        print("Forbidden: bot role must be выше выдаваемых ролей + Manage Roles.")
     except Exception as e:
-        print("Ошибка выдачи ранговой роли:", e)
+        print("apply_level_role error:", e)
 
+# =========================
+# REACTION ROLE HELPERS
+# =========================
 
 async def add_reaction_role(guild_id: int, user_id: int, emoji: str):
     role_id = REACTION_ROLE_MAP.get(emoji)
@@ -133,11 +166,8 @@ async def add_reaction_role(guild_id: int, user_id: int, emoji: str):
         return
 
     member = guild.get_member(user_id)
-    if member is None:
-        try:
-            member = await guild.fetch_member(user_id)
-        except Exception:
-            return
+    if not member:
+        return
 
     role = guild.get_role(role_id)
     if not role:
@@ -147,10 +177,9 @@ async def add_reaction_role(guild_id: int, user_id: int, emoji: str):
         if role not in member.roles:
             await member.add_roles(role, reason="Reaction role")
     except discord.Forbidden:
-        print("Нет прав выдавать роли (Forbidden). Проверь Manage Roles и позицию роли бота.")
+        print("Forbidden: нет прав выдавать роли (Manage Roles/позиция ролей).")
     except Exception as e:
-        print("Ошибка выдачи reaction роли:", e)
-
+        print("add_reaction_role error:", e)
 
 async def remove_reaction_role(guild_id: int, user_id: int, emoji: str):
     role_id = REACTION_ROLE_MAP.get(emoji)
@@ -162,11 +191,8 @@ async def remove_reaction_role(guild_id: int, user_id: int, emoji: str):
         return
 
     member = guild.get_member(user_id)
-    if member is None:
-        try:
-            member = await guild.fetch_member(user_id)
-        except Exception:
-            return
+    if not member:
+        return
 
     role = guild.get_role(role_id)
     if not role:
@@ -176,78 +202,51 @@ async def remove_reaction_role(guild_id: int, user_id: int, emoji: str):
         if role in member.roles:
             await member.remove_roles(role, reason="Reaction role removed")
     except discord.Forbidden:
-        print("Нет прав снимать роли (Forbidden). Проверь Manage Roles и позицию роли бота.")
+        print("Forbidden: нет прав снимать роли.")
     except Exception as e:
-        print("Ошибка снятия reaction роли:", e)
-
-
-def member_voice_eligible(member: discord.Member) -> bool:
-    vs = member.voice
-    if not vs or not vs.channel:
-        return False
-    if VOICE_IGNORE_DEAFENED and (vs.self_deaf or vs.deaf):
-        return False
-    return True
-
-
-def eligible_members_in_channel(channel: discord.VoiceChannel | discord.StageChannel) -> list[discord.Member]:
-    members: list[discord.Member] = []
-    for m in channel.members:
-        if isinstance(m, discord.Member) and (not m.bot) and member_voice_eligible(m):
-            members.append(m)
-    return members
-
+        print("remove_reaction_role error:", e)
 
 # =========================
-# VOICE XP LOOP
+# DB SCHEMA + STARTUP
 # =========================
 
-@tasks.loop(seconds=VOICE_TICK_SEC)
-async def voice_xp_tick():
-    for guild in bot.guilds:
-        for channel in guild.voice_channels:
-            eligible = eligible_members_in_channel(channel)
+async def ensure_schema():
+    # таблица с XP/активностью
+    await db_exec("""
+    CREATE TABLE IF NOT EXISTS user_stats (
+        guild_id BIGINT NOT NULL,
+        user_id  BIGINT NOT NULL,
+        xp BIGINT NOT NULL DEFAULT 0,
+        message_count BIGINT NOT NULL DEFAULT 0,
+        voice_seconds BIGINT NOT NULL DEFAULT 0,
+        last_msg_xp_ts BIGINT NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (guild_id, user_id)
+    );
+    """)
 
-            # анти-фарм: минимум людей
-            if len(eligible) < VOICE_MIN_MEMBERS:
-                continue
+    # настройки сервера
+    await db_exec("""
+    CREATE TABLE IF NOT EXISTS guild_settings (
+        guild_id BIGINT PRIMARY KEY,
+        role_message_id BIGINT NOT NULL DEFAULT 0,
+        auto_voice_hub_id BIGINT NOT NULL DEFAULT 0
+    );
+    """)
 
-            for member in eligible:
-                key = (guild.id, member.id)
-                if not IN_VOICE.get(key):
-                    continue
+async def load_guild_settings_into_memory():
+    global ROLE_MESSAGE_ID, AUTO_VOICE_HUB_ID
 
-                gained = random.randint(VOICE_XP_MIN, VOICE_XP_MAX)
+    rows = await db_fetch("SELECT guild_id, role_message_id, auto_voice_hub_id FROM guild_settings;")
+    if not rows:
+        return
 
-                row = await db.fetchrow(
-    "SELECT xp FROM user_stats WHERE guild_id=$1 AND user_id=$2",
-    message.guild.id,
-    message.author.id
-)
-
-old_xp = row["xp"] if row else 0
-new_xp = old_xp + gained
-
-await db.execute("""
-INSERT INTO user_stats (guild_id, user_id, xp, message_count)
-VALUES ($1,$2,$3,1)
-ON CONFLICT (guild_id,user_id)
-DO UPDATE SET
-xp = user_stats.xp + $4,
-message_count = user_stats.message_count + 1
-""",
-message.guild.id,
-message.author.id,
-gained,
-gained
-)
-
-                old_lvl = level_from_xp(old_xp)
-                new_lvl = level_from_xp(new_xp)
-
-                if new_lvl > old_lvl:
-                    await apply_level_role(member, new_lvl)
-
+    # В этом боте предполагаем 1 сервер, но на всякий оставим "последнее"
+    for r in rows:
+        if r["role_message_id"]:
+            ROLE_MESSAGE_ID = int(r["role_message_id"])
+        if r["auto_voice_hub_id"]:
+            AUTO_VOICE_HUB_ID = int(r["auto_voice_hub_id"])
 
 # =========================
 # EVENTS
@@ -256,50 +255,25 @@ gained
 @bot.event
 async def on_ready():
     global db
-
     print(f"🐻 Berloga Bot запущен как {bot.user}")
 
-    if DATABASE_URL and db is None:
+    if db is None:
         db = await asyncpg.connect(DATABASE_URL)
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS user_stats (
-            guild_id BIGINT,
-            user_id BIGINT,
-            xp INT DEFAULT 0,
-            voice_seconds INT DEFAULT 0,
-            message_count INT DEFAULT 0,
-            PRIMARY KEY (guild_id, user_id)
-        );
-        """)
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS reaction_roles (
-            guild_id BIGINT,
-            message_id BIGINT,
-            emoji TEXT,
-            role_id BIGINT
-        );
-        """)
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS moderation_settings (
-            guild_id BIGINT PRIMARY KEY,
-            block_everyone BOOLEAN DEFAULT true,
-            timeout_minutes INT DEFAULT 60
-        );
-        """)
-
         print("✅ Database connected")
+
+        await ensure_schema()
+        await load_guild_settings_into_memory()
+        print(f"✅ Settings loaded: ROLE_MESSAGE_ID={ROLE_MESSAGE_ID}, AUTO_VOICE_HUB_ID={AUTO_VOICE_HUB_ID}")
 
     if not voice_xp_tick.is_running():
         voice_xp_tick.start()
 
+    if not auto_voice_cleanup.is_running():
+        auto_voice_cleanup.start()
 
 @bot.command()
 async def ping(ctx):
     await ctx.send("🏓 Pong!")
-
 
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -312,35 +286,20 @@ async def on_member_join(member: discord.Member):
             "Удачного клёва!"
         )
     except Exception:
-        print("Не удалось отправить ЛС пользователю")
+        print("Не удалось отправить ЛС пользователю (возможно закрыты DM).")
 
-
-@bot.event
-async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    if not member.guild:
-        return
-
-    key = (member.guild.id, member.id)
-
-    if after.channel is None:
-        IN_VOICE.pop(key, None)
-        return
-
-    # в войсе, но если deaf — не учитываем
-    if VOICE_IGNORE_DEAFENED and (after.self_deaf or after.deaf):
-        IN_VOICE.pop(key, None)
-        return
-
-    IN_VOICE[key] = True
-
+# =========================
+# REACTION ROLES (RAW)
+# =========================
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.user_id == bot.user.id:
         return
-    if ROLE_MESSAGE_ID and payload.message_id != ROLE_MESSAGE_ID:
-        return
     if payload.guild_id is None:
+        return
+
+    if ROLE_MESSAGE_ID and payload.message_id != ROLE_MESSAGE_ID:
         return
 
     emoji = str(payload.emoji)
@@ -349,12 +308,12 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
     await add_reaction_role(payload.guild_id, payload.user_id, emoji)
 
-
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    if ROLE_MESSAGE_ID and payload.message_id != ROLE_MESSAGE_ID:
-        return
     if payload.guild_id is None:
+        return
+
+    if ROLE_MESSAGE_ID and payload.message_id != ROLE_MESSAGE_ID:
         return
 
     emoji = str(payload.emoji)
@@ -363,6 +322,9 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 
     await remove_reaction_role(payload.guild_id, payload.user_id, emoji)
 
+# =========================
+# XP: MESSAGES
+# =========================
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -371,40 +333,148 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-    key = (message.guild.id, message.author.id)
-    now = time.time()
-
-    if now - LAST_XP_TS.get(key, 0) < XP_COOLDOWN:
-        return
-
     content = (message.content or "").strip()
     if len(content) < MIN_MSG_LEN:
         return
 
-    LAST_XP_TS[key] = now
-    gained = random.randint(XP_MIN, XP_MAX)
+    guild_id = message.guild.id
+    user_id = message.author.id
 
-    old_xp = USER_XP.get(key, 0)
-    new_xp = old_xp + gained
-    USER_XP[key] = new_xp
+    # достаем last_msg_xp_ts
+    row = await db_fetchrow(
+        "SELECT xp, last_msg_xp_ts FROM user_stats WHERE guild_id=$1 AND user_id=$2;",
+        guild_id, user_id
+    )
 
-    old_lvl = level_from_xp(old_xp)
+    now_ts = int(time.time())
+    last_ts = int(row["last_msg_xp_ts"]) if row else 0
+    if now_ts - last_ts < MSG_XP_COOLDOWN:
+        # но сообщения считаем для статистики
+        await db_exec("""
+        INSERT INTO user_stats (guild_id, user_id, message_count)
+        VALUES ($1,$2,1)
+        ON CONFLICT (guild_id, user_id)
+        DO UPDATE SET message_count = user_stats.message_count + 1, updated_at=NOW();
+        """, guild_id, user_id)
+        return
+
+    gained = random.randint(MSG_XP_MIN, MSG_XP_MAX)
+
+    # обновляем xp + message_count + last_msg_xp_ts
+    await db_exec("""
+    INSERT INTO user_stats (guild_id, user_id, xp, message_count, last_msg_xp_ts)
+    VALUES ($1,$2,$3,1,$4)
+    ON CONFLICT (guild_id, user_id)
+    DO UPDATE SET
+      xp = user_stats.xp + $3,
+      message_count = user_stats.message_count + 1,
+      last_msg_xp_ts = $4,
+      updated_at = NOW();
+    """, guild_id, user_id, gained, now_ts)
+
+    # проверяем ап уровня
+    new_row = await db_fetchrow("SELECT xp FROM user_stats WHERE guild_id=$1 AND user_id=$2;", guild_id, user_id)
+    if not new_row:
+        return
+
+    new_xp = int(new_row["xp"])
     new_lvl = level_from_xp(new_xp)
 
-    if new_lvl > old_lvl:
-        try:
-            await apply_level_role(message.author, new_lvl)
-        except Exception as e:
-            print("Ошибка при апдейте ранговой роли:", e)
-
+    # применяем ранговую роль
+    try:
+        await apply_level_role(message.author, new_lvl)
+    except Exception as e:
+        print("Ошибка ранговой роли:", e)
 
 # =========================
-# ADMIN COMMANDS
+# XP: VOICE (TICK)
 # =========================
+
+@tasks.loop(seconds=VOICE_TICK_SECONDS)
+async def voice_xp_tick():
+    # по всем серверам, где бот есть
+    for guild in bot.guilds:
+        for member in guild.members:
+            if member.bot:
+                continue
+            if not member.voice or not member.voice.channel:
+                continue
+
+            # если хочешь учитывать только людей, которые не одни — поставь VOICE_MIN_MEMBERS=2
+            channel = member.voice.channel
+            if len(channel.members) < VOICE_MIN_MEMBERS:
+                continue
+
+            # +voice seconds
+            await db_exec("""
+            INSERT INTO user_stats (guild_id, user_id, voice_seconds, xp)
+            VALUES ($1,$2,$3,$4)
+            ON CONFLICT (guild_id, user_id)
+            DO UPDATE SET
+              voice_seconds = user_stats.voice_seconds + $3,
+              xp = user_stats.xp + $4,
+              updated_at = NOW();
+            """, guild.id, member.id, VOICE_TICK_SECONDS, VOICE_XP_PER_TICK)
+
+            # ранговая роль по новому xp
+            row = await db_fetchrow("SELECT xp FROM user_stats WHERE guild_id=$1 AND user_id=$2;", guild.id, member.id)
+            if row:
+                lvl = level_from_xp(int(row["xp"]))
+                await apply_level_role(member, lvl)
+
+# =========================
+# AUTO VOICE: CREATE + MOVE + CLEANUP
+# =========================
+
+async def is_hub_channel(channel: discord.VoiceChannel) -> bool:
+    return AUTO_VOICE_HUB_ID != 0 and channel.id == AUTO_VOICE_HUB_ID
 
 def is_admin(member: discord.Member) -> bool:
     return member.guild_permissions.administrator
 
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    # Заход в HUB: создаём новый войс и переносим
+    if after.channel and isinstance(after.channel, discord.VoiceChannel):
+        if await is_hub_channel(after.channel):
+            guild = member.guild
+
+            # создаём новый канал рядом с HUB по категории
+            category = after.channel.category
+            base_name = "🎙 Комната"
+            new_name = f"{base_name} — {member.display_name}"
+
+            try:
+                new_channel = await guild.create_voice_channel(
+                    name=new_name,
+                    category=category,
+                    reason="Auto voice create"
+                )
+                await member.move_to(new_channel, reason="Auto voice move")
+            except discord.Forbidden:
+                print("Forbidden: нужны права Manage Channels + Move Members.")
+            except Exception as e:
+                print("Auto voice create/move error:", e)
+
+@tasks.loop(minutes=2)
+async def auto_voice_cleanup():
+    # Удаляем пустые авто-каналы, которые были созданы ботом
+    for guild in bot.guilds:
+        for ch in guild.voice_channels:
+            # не трогаем HUB
+            if AUTO_VOICE_HUB_ID and ch.id == AUTO_VOICE_HUB_ID:
+                continue
+
+            # удаляем только каналы, созданные ботом по шаблону
+            if ch.name.startswith("🎙 Комната") and len(ch.members) == 0:
+                try:
+                    await ch.delete(reason="Auto voice cleanup (empty)")
+                except Exception:
+                    pass
+
+# =========================
+# COMMANDS: SETTINGS
+# =========================
 
 @bot.command()
 async def setrolemsg(ctx, message_id: int):
@@ -414,26 +484,26 @@ async def setrolemsg(ctx, message_id: int):
     global ROLE_MESSAGE_ID
     ROLE_MESSAGE_ID = int(message_id)
 
-    await ctx.reply(
-        f"✅ ROLE_MESSAGE_ID установлен: `{ROLE_MESSAGE_ID}`\n"
-        f"Теперь реакции на это сообщение будут выдавать роли."
-    )
+    await db_exec("""
+    INSERT INTO guild_settings (guild_id, role_message_id)
+    VALUES ($1,$2)
+    ON CONFLICT (guild_id)
+    DO UPDATE SET role_message_id=$2;
+    """, ctx.guild.id, ROLE_MESSAGE_ID)
 
+    await ctx.reply(f"✅ ROLE_MESSAGE_ID установлен: `{ROLE_MESSAGE_ID}`")
 
 @bot.command()
 async def syncroles(ctx):
     if not is_admin(ctx.author):
         return await ctx.reply("⛔ Только админ может это делать.")
     if not ROLE_MESSAGE_ID:
-        return await ctx.reply("⚠ Сначала задай ROLE_MESSAGE_ID командой `!setrolemsg <id>`.")
+        return await ctx.reply("⚠ Сначала `!setrolemsg <id>`")
 
     try:
         msg = await ctx.channel.fetch_message(ROLE_MESSAGE_ID)
     except Exception:
-        return await ctx.reply(
-            "❌ Не смог найти сообщение по ROLE_MESSAGE_ID в этом канале. "
-            "Убедись, что ты запускаешь команду в том же канале."
-        )
+        return await ctx.reply("❌ Не нашёл сообщение в этом канале. Запусти команду в том же канале где сообщение.")
 
     for emoji in REACTION_ROLE_MAP.keys():
         try:
@@ -443,32 +513,94 @@ async def syncroles(ctx):
 
     await ctx.reply("✅ Реакции добавлены на сообщение.")
 
+@bot.command()
+async def setautovoice(ctx, hub_channel_id: int):
+    """Задаёт Voice HUB канал: заходишь в него -> создаётся новая комната и переносит."""
+    if not is_admin(ctx.author):
+        return await ctx.reply("⛔ Только админ может это делать.")
+
+    global AUTO_VOICE_HUB_ID
+    AUTO_VOICE_HUB_ID = int(hub_channel_id)
+
+    await db_exec("""
+    INSERT INTO guild_settings (guild_id, auto_voice_hub_id)
+    VALUES ($1,$2)
+    ON CONFLICT (guild_id)
+    DO UPDATE SET auto_voice_hub_id=$2;
+    """, ctx.guild.id, AUTO_VOICE_HUB_ID)
+
+    await ctx.reply(f"✅ AUTO_VOICE_HUB_ID установлен: `{AUTO_VOICE_HUB_ID}`")
+
+# =========================
+# COMMANDS: STATS / LEADERBOARDS
+# =========================
 
 @bot.command()
-async def xp(ctx, member: discord.Member | None = None):
+async def xp(ctx, member: Optional[discord.Member] = None):
     member = member or ctx.author
-    key = (ctx.guild.id, member.id)
-    xp_val = USER_XP.get(key, 0)
+    row = await db_fetchrow(
+        "SELECT xp, message_count, voice_seconds FROM user_stats WHERE guild_id=$1 AND user_id=$2;",
+        ctx.guild.id, member.id
+    )
+    if not row:
+        return await ctx.reply(f"📈 {member.mention}: пока нет статистики.")
+    xp_val = int(row["xp"])
     lvl = level_from_xp(xp_val)
-    await ctx.reply(f"📈 {member.mention}: XP = **{xp_val}**, уровень = **{lvl}**")
-
+    voice_sec = int(row["voice_seconds"])
+    mins = voice_sec // 60
+    await ctx.reply(f"📈 {member.mention}: XP=**{xp_val}**, lvl=**{lvl}**, msgs=**{row['message_count']}**, voice=**{mins} мин**")
 
 @bot.command()
-async def rank(ctx, member: discord.Member | None = None):
-    member = member or ctx.author
-    key = (ctx.guild.id, member.id)
-    xp_val = USER_XP.get(key, 0)
-    lvl = level_from_xp(xp_val)
-    role_id = best_level_role_id(lvl)
-    role = ctx.guild.get_role(role_id) if role_id else None
-    await ctx.reply(f"🏅 {member.mention}: уровень **{lvl}** | роль: **{role.name if role else 'нет'}**")
+async def topxp(ctx, limit: int = 10):
+    limit = max(1, min(limit, 25))
+    rows = await db_fetch(
+        "SELECT user_id, xp FROM user_stats WHERE guild_id=$1 ORDER BY xp DESC LIMIT $2;",
+        ctx.guild.id, limit
+    )
+    if not rows:
+        return await ctx.reply("Пока пусто.")
+    lines = []
+    for i, r in enumerate(rows, start=1):
+        user = ctx.guild.get_member(int(r["user_id"]))
+        name = user.display_name if user else f"<@{r['user_id']}>"
+        lines.append(f"**{i}.** {name} — **{int(r['xp'])} XP**")
+    await ctx.reply("🏆 **TOP XP**\n" + "\n".join(lines))
 
+@bot.command()
+async def topvoice(ctx, limit: int = 10):
+    limit = max(1, min(limit, 25))
+    rows = await db_fetch(
+        "SELECT user_id, voice_seconds FROM user_stats WHERE guild_id=$1 ORDER BY voice_seconds DESC LIMIT $2;",
+        ctx.guild.id, limit
+    )
+    if not rows:
+        return await ctx.reply("Пока пусто.")
+    lines = []
+    for i, r in enumerate(rows, start=1):
+        user = ctx.guild.get_member(int(r["user_id"]))
+        name = user.display_name if user else f"<@{r['user_id']}>"
+        mins = int(r["voice_seconds"]) // 60
+        lines.append(f"**{i}.** {name} — **{mins} мин**")
+    await ctx.reply("🎙 **TOP VOICE**\n" + "\n".join(lines))
+
+@bot.command()
+async def topmsg(ctx, limit: int = 10):
+    limit = max(1, min(limit, 25))
+    rows = await db_fetch(
+        "SELECT user_id, message_count FROM user_stats WHERE guild_id=$1 ORDER BY message_count DESC LIMIT $2;",
+        ctx.guild.id, limit
+    )
+    if not rows:
+        return await ctx.reply("Пока пусто.")
+    lines = []
+    for i, r in enumerate(rows, start=1):
+        user = ctx.guild.get_member(int(r["user_id"]))
+        name = user.display_name if user else f"<@{r['user_id']}>"
+        lines.append(f"**{i}.** {name} — **{int(r['message_count'])} сообщений**")
+    await ctx.reply("💬 **TOP MESSAGES**\n" + "\n".join(lines))
 
 # =========================
 # RUN
 # =========================
-
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN не задан. Добавь переменную окружения DISCORD_TOKEN в Railway.")
 
 bot.run(TOKEN)
