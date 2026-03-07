@@ -631,6 +631,33 @@ async def restart(ctx):
     # Завершаем процесс — Railway обычно поднимет снова
     os._exit(0)
 
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if member.bot:
+        return
+
+    print(f"[VOICE] {member} moved: before={getattr(before.channel, 'id', None)} after={getattr(after.channel, 'id', None)}")
+
+    if not after.channel:
+        return
+
+    if not isinstance(after.channel, discord.VoiceChannel):
+        return
+
+    settings = await get_settings(member.guild.id)
+    hub_id = settings["auto_voice_hub_id"]
+
+    print(f"[VOICE] hub_id={hub_id} joined={after.channel.id}")
+
+    if hub_id and after.channel.id == hub_id:
+        print("[VOICE] hub matched → creating room")
+        await create_or_move_personal_room(member, after.channel)
+
+
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN не задан. Добавь его в Railway Variables.")
+bot.run(TOKEN)
+
 # =========================
 # RUN
 # =========================
