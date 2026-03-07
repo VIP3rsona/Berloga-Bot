@@ -64,6 +64,15 @@ VOICE_XP_PER_TICK = 5
 AUTO_VOICE_BASE_NAME = "🧊 Комната"
 AUTO_VOICE_CLEANUP_SECONDS = 60
 
+# ==============================
+# Каналы где РАЗРЕШЕНЫ команды
+# ==============================
+
+ALLOWED_COMMAND_CHANNEL_IDS = {
+    1479873230146637864,  # bot-commands
+    1477937956248490078,  # admin-bot
+}
+
 # =========================
 # DISCORD INIT
 # =========================
@@ -444,8 +453,17 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    await bot.process_commands(message)
+    # -------------------------
+    # Команды только в разрешённых каналах
+    # -------------------------
+    if message.content.startswith(("!", ".")):
+        if message.channel.id in ALLOWED_COMMAND_CHANNEL_IDS:
+            await bot.process_commands(message)
+        return
 
+    # -------------------------
+    # XP за сообщения во ВСЕХ каналах
+    # -------------------------
     if not db:
         return
 
@@ -469,16 +487,10 @@ async def on_message(message: discord.Message):
 
         if level_from_xp(new_xp) > level_from_xp(old_xp):
             await apply_level_role(message.author, level_from_xp(new_xp))
+
     except Exception as e:
         print("on_message xp error:", e)
-
-@bot.event
-async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    if member.bot or not after.channel:
-        return
-    if isinstance(after.channel, discord.VoiceChannel) and await is_hub_channel(after.channel):
-        await create_or_move_personal_room(member, after.channel)
-
+        
 # =========================
 # COMMANDS (public)
 # =========================
