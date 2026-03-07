@@ -636,7 +636,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     if member.bot:
         return
 
-    print(f"[VOICE] {member} moved: before={getattr(before.channel, 'id', None)} after={getattr(after.channel, 'id', None)}")
+    (f"[VOICE] {member} moved: before={getattr(before.channel, 'id', None)} after={getattr(after.channel, 'id', None)}")
 
     if not after.channel:
         return
@@ -647,10 +647,10 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     settings = await get_settings(member.guild.id)
     hub_id = settings["auto_voice_hub_id"]
 
-    print(f"[VOICE] hub_id={hub_id} joined={after.channel.id}")
+    (f"[VOICE] hub_id={hub_id} joined={after.channel.id}")
 
     if hub_id and after.channel.id == hub_id:
-        print("[VOICE] hub matched → creating room")
+        ("[VOICE] hub matched → creating room")
         await create_or_move_personal_room(member, after.channel)
 
 
