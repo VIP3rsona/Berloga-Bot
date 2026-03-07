@@ -654,10 +654,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         await create_or_move_personal_room(member, after.channel)
 
 
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN не задан. Добавь его в Railway Variables.")
-bot.run(TOKEN)
-
 # =========================
 # RUN
 # =========================
