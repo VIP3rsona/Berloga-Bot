@@ -253,6 +253,155 @@ async def apply_level_role(member: discord.Member, level: int):
         print("apply_level_role error:", e)
 
 # =========================
+# RANK / LEADERBOARD HELPERS
+# =========================
+
+def xp_for_level(level: int) -> int:
+    if level <= 1:
+        return 0
+    return 600 * ((level - 1) ** 2)
+
+def format_voice_time(seconds: int) -> str:
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    if hours > 0:
+        return f"{hours} ч {minutes} мин"
+    return f"{minutes} мин"
+
+def render_progress_bar(current: int, total: int, size: int = 12) -> str:
+    if total <= 0:
+        total = 1
+    ratio = max(0.0, min(1.0, current / total))
+    filled = round(ratio * size)
+    return "█" * filled + "░" * (size - filled)
+
+async def get_top_xp_rows(guild_id: int, limit: int = 10):
+    async with db.acquire() as conn:
+        return await conn.fetch("""
+            SELECT user_id, xp, voice_seconds, msg_count
+            FROM user_stats
+            WHERE guild_id = $1
+            ORDER BY xp DESC, voice_seconds DESC, msg_count DESC
+            LIMIT $2
+        """, guild_id, limit)
+
+async def get_top_voice_rows(guild_id: int, limit: int = 10):
+    async with db.acquire() as conn:
+        return await conn.fetch("""
+            SELECT user_id, xp, voice_seconds, msg_count
+            FROM user_stats
+            WHERE guild_id = $1
+            ORDER BY voice_seconds DESC, xp DESC, msg_count DESC
+            LIMIT $2
+        """, guild_id, limit)
+
+async def get_user_position_by_xp(guild_id: int, user_id: int) -> int:
+    async with db.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT place FROM (
+                SELECT user_id,
+                       ROW_NUMBER() OVER (
+                           ORDER BY xp DESC, voice_seconds DESC, msg_count DESC
+                       ) AS place
+                FROM user_stats
+                WHERE guild_id = $1
+            ) t
+            WHERE user_id = $2
+        """, guild_id, user_id)
+    return int(row["place"]) if row else 0
+
+async def get_user_position_by_voice(guild_id: int, user_id: int) -> int:
+    async with db.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT place FROM (
+                SELECT user_id,
+                       ROW_NUMBER() OVER (
+                           ORDER BY voice_seconds DESC, xp DESC, msg_count DESC
+                       ) AS place
+                FROM user_stats
+                WHERE guild_id = $1
+            ) t
+            WHERE user_id = $2
+        """, guild_id, user_id)
+    return int(row["place"]) if row else 0
+
+def make_xp_card(member: discord.Member, xp_val: int, voice_sec: int, msg_count: int, rank_xp: int, rank_voice: int):
+    lvl = level_from_xp(xp_val)
+
+    current_level_start = xp_for_level(lvl)
+    next_level_start = xp_for_level(lvl + 1)
+
+    progress_now = xp_val - current_level_start
+    progress_need = max(1, next_level_start - current_level_start)
+    progress_left = max(0, next_level_start - xp_val)
+
+    bar = render_progress_bar(progress_now, progress_need, size=14)
+
+    embed = discord.Embed(
+        title="🎣 Карточка рыбака",
+        description=f"Статистика для {member.mention}",
+        color=member.color if member.color != discord.Color.default() else discord.Color.blurple()
+    )
+    embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
+    embed.set_thumbnail(url=member.display_avatar.url)
+
+    embed.add_field(name="Уровень", value=f"**{lvl}**", inline=True)
+    embed.add_field(name="XP", value=f"**{xp_val}**", inline=True)
+    embed.add_field(name="Сообщения", value=f"**{msg_count}**", inline=True)
+
+    embed.add_field(
+        name="Прогресс до следующего уровня",
+        value=f"`{bar}`\n**{progress_now}/{progress_need} XP**",
+        inline=False
+    )
+
+    embed.add_field(name="До следующего уровня", value=f"**{progress_left} XP**", inline=True)
+    embed.add_field(name="Место по XP", value=f"**#{rank_xp if rank_xp else '—'}**", inline=True)
+    embed.add_field(name="Место по войсу", value=f"**#{rank_voice if rank_voice else '—'}**", inline=True)
+
+    embed.add_field(name="Войс онлайн", value=f"**{format_voice_time(voice_sec)}**", inline=False)
+    embed.set_footer(text="Берлога • система активности")
+    return embed
+
+def make_top_card(title: str, rows, guild: discord.Guild, mode: str):
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    place = 1
+
+    for row in rows:
+        member = guild.get_member(int(row["user_id"]))
+        if not member or member.bot:
+            continue
+
+        prefix = medals[place - 1] if place <= 3 else f"`{place}.`"
+        lvl = level_from_xp(int(row["xp"]))
+
+        if mode == "xp":
+            line = (
+                f"{prefix} {member.mention}\n"
+                f"└ XP: **{int(row['xp'])}** • Уровень: **{lvl}** • Войс: **{format_voice_time(int(row['voice_seconds']))}**"
+            )
+        else:
+            line = (
+                f"{prefix} {member.mention}\n"
+                f"└ Войс: **{format_voice_time(int(row['voice_seconds']))}** • XP: **{int(row['xp'])}** • Уровень: **{lvl}**"
+            )
+
+        lines.append(line)
+        place += 1
+
+    if not lines:
+        lines = ["Пока нет данных для отображения."]
+
+    embed = discord.Embed(
+        title=title,
+        description="\n\n".join(lines),
+        color=discord.Color.gold() if mode == "xp" else discord.Color.purple()
+    )
+    embed.set_footer(text=f"Сервер: {guild.name}")
+    return embed
+    
+# =========================
 # REACTION ROLES
 # =========================
 async def add_reaction_role(guild_id: int, user_id: int, emoji: str):
@@ -501,25 +650,39 @@ async def ping(ctx):
 @bot.command(name="xp")
 async def xp_cmd(ctx, member: Optional[discord.Member] = None):
     member = member or ctx.author
+
     if not db:
         return await ctx.reply("⚠ База не подключена, XP временно недоступен.")
-    xp_val, voice_sec, msg_count = await get_user_row(ctx.guild.id, member.id)
-    lvl = level_from_xp(xp_val)
-    await ctx.reply(
-        f"📈 {member.mention}: XP = **{xp_val}**, уровень = **{lvl}**, "
-        f"войс = **{voice_sec//60} мин**, сообщений = **{msg_count}**"
-    )
 
+    xp_val, voice_sec, msg_count = await get_user_row(ctx.guild.id, member.id)
+    rank_xp = await get_user_position_by_xp(ctx.guild.id, member.id)
+    rank_voice = await get_user_position_by_voice(ctx.guild.id, member.id)
+
+    embed = make_xp_card(member, xp_val, voice_sec, msg_count, rank_xp, rank_voice)
+    await ctx.reply(embed=embed, mention_author=False)
+    
 @bot.command()
 async def rank(ctx, member: Optional[discord.Member] = None):
-    member = member or ctx.author
+    await xp_cmd(ctx, member)
+
+@bot.command(name="leader")
+async def leader_cmd(ctx):
     if not db:
         return await ctx.reply("⚠ База не подключена.")
-    xp_val, _, _ = await get_user_row(ctx.guild.id, member.id)
-    lvl = level_from_xp(xp_val)
-    role_id = best_level_role_id(lvl)
-    role = ctx.guild.get_role(role_id) if role_id else None
-    await ctx.reply(f"🏅 {member.mention}: уровень **{lvl}** | роль: **{role.name if role else 'нет'}**")
+
+    rows = await get_top_xp_rows(ctx.guild.id, limit=10)
+    embed = make_top_card("🏆 Топ по опыту", rows, ctx.guild, mode="xp")
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.command(name="top")
+async def top_cmd(ctx):
+    if not db:
+        return await ctx.reply("⚠ База не подключена.")
+
+    rows = await get_top_voice_rows(ctx.guild.id, limit=10)
+    embed = make_top_card("🎙 Топ по войсу", rows, ctx.guild, mode="voice")
+    await ctx.reply(embed=embed, mention_author=False)
 
 @bot.command()
 @commands.is_owner()
